@@ -103,6 +103,8 @@ def init_db():
     except Exception as e:
         logging.error(f"Error initializing database: {e}")
 
+
+
 def save_new_dialog(chat_id):
     try:
         con = sqlite3.connect(DB_FILE)
@@ -420,6 +422,14 @@ def webhook_handler():
 
     if event == 'ONAPPINSTALL':
         logging.info("Handling ONAPPINSTALL event.")
+
+        #Если вдруг удалили бд
+        try:
+            init_db()
+            logging.info("DB ensured during ONAPPINSTALL.")
+        except Exception as e:
+            logging.error(f"init_db() failed during ONAPPINSTALL: {e}")
+
         if not save_auth_data(auth_from_request):
             return "Failed to save auth", 500
 
