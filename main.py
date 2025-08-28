@@ -10,7 +10,7 @@ import requests
 from flask import Flask, request, jsonify, abort, Response
 from logging.handlers import RotatingFileHandler
 
-# --- Базовая директория инстанса (каталог, где лежит этот файл) ---
+# --- Базовая директория инстанса ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- Файлы инстанса ---
@@ -19,17 +19,13 @@ AUTH_FILE = os.path.join(BASE_DIR, "auth.json")
 DB_FILE   = os.path.join(BASE_DIR, "dialogs.db")
 
 # Файлы-флаги для мягкого включения/выключения
-ENABLED_FLAG  = os.path.join(BASE_DIR, "ENABLED")   # если нужен явный "включен"
-DISABLED_FLAG = os.path.join(BASE_DIR, "DISABLED")  # если существует — бот выключен
+ENABLED_FLAG  = os.path.join(BASE_DIR, "ENABLED")
+DISABLED_FLAG = os.path.join(BASE_DIR, "DISABLED")
 
-# --- Переменные окружения/настройки инстанса ---
-# Имя инстанса: берём из ENV или из имени директории
+# --- Переменные окружения/настройки ---
 INSTANCE = os.environ.get('INSTANCE') or os.path.basename(BASE_DIR)
-# Код бота в Bitrix24 (должен быть уникальным в портале)
 BOT_CODE = os.environ.get('BOT_CODE', f'py_interceptor_bot_{INSTANCE}')
-# Секретный токен для админ-эндпойнтов (ENV предпочтительнее)
 API_SECRET_TOKEN = os.environ.get('API_SECRET_TOKEN', 'asd1a2s3d4asd41a23sdas4d')
-# Уровень логирования (можно менять через /api/admin/loglevel)
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
 
 # --- Логирование с ротацией ---
@@ -39,16 +35,14 @@ fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s:%(lineno)d - %(m
 
 file_handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding='utf-8')
 file_handler.setFormatter(fmt)
-
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(fmt)
-
 logger.handlers = [file_handler, stream_handler]
 
 app = Flask(__name__)
 
 # --- Маскирование секретов в логах ---
-SENSITIVE_KEYS = {'token', 'access_token', 'refresh_token', 'application_token', 'client_secret', 'API_SECRET_TOKEN', 'auth'}
+SENSITIVE_KEYS = {'token','access_token','refresh_token','application_token','client_secret','API_SECRET_TOKEN','auth'}
 
 def _mask_val(v: str) -> str:
     if not isinstance(v, str) or len(v) <= 8:
@@ -56,9 +50,8 @@ def _mask_val(v: str) -> str:
     return v[:4] + '…' + v[-4:]
 
 def redact(obj):
-    """Рекурсивно маскирует чувствительные поля в dict/list/str для логов."""
     if isinstance(obj, dict):
-        return {k: (_mask_val(v) if k.lower() in SENSITIVE_KEYS else redact(v)) for k, v in obj.items()}
+        return {k: (_mask_val(v) if k.lower() in SENSITIVE_KEYS else redact(v)) for k,v in obj.items()}
     if isinstance(obj, list):
         return [redact(x) for x in obj]
     return obj
@@ -71,14 +64,9 @@ _startup_dump()
 
 # ---------------------- Утилиты ----------------------
 def bot_enabled() -> bool:
-    """Мягкое включение/выключение: DISABLED → выключен, иначе включен."""
     return not os.path.exists(DISABLED_FLAG)
 
 def public_handler_url():
-    """
-    Строит публичный URL обработчика с учётом префикса, который добавляет Nginx.
-    Nginx передаёт заголовок X-Forwarded-Prefix: "/<instance>"
-    """
     proto  = request.headers.get('X-Forwarded-Proto', request.scheme or 'http')
     prefix = request.headers.get('X-Forwarded-Prefix', '')
     public_path = (prefix.rstrip('/') + request.path) if prefix else request.path
@@ -86,7 +74,6 @@ def public_handler_url():
 
 # ---------------------- Работа с БД ----------------------
 def init_db():
-    """Инициализирует базу данных и создаёт таблицы, если их нет."""
     try:
         con = sqlite3.connect(DB_FILE)
         cur = con.cursor()
@@ -131,7 +118,6 @@ def init_db():
         logging.error(f"Error initializing database: {e}")
 
 def ensure_db_exists():
-    """Создать БД и таблицы, если файла нет или структура отсутствует."""
     try:
         need = not os.path.exists(DB_FILE)
         if not need:
@@ -146,42 +132,12 @@ def ensure_db_exists():
     except Exception as e:
         logging.error(f"ensure_db_exists failed: {e}")
 
-# Гарантия при старте воркера gunicorn
+# гарантия при старте воркера gunicorn
 ensure_db_exists()
-
-def save_new_dialog(chat_id):
-    try:
-        con = sqlite3.connect(DB_FILE)
-        cur = con.cursor()
-        start_time = datetime.now().isoformat()
-        cur.execute(
-            "INSERT OR IGNORE INTO dialogs (chat_id, start_time) VALUES (?, ?)",
-            (chat_id, start_time)
-        )
-        con.commit()
-        con.close()
-        logging.info(f"Saved new dialog with chat_id: {chat_id}")
-    except Exception as e:
-        logging.error(f"Error saving new dialog {chat_id}: {e}")
-
-def save_message(chat_id, author_id, message_text):
-    try:
-        con = sqlite3.connect(DB_FILE)
-        cur = con.cursor()
-        timestamp = datetime.now().isoformat()
-        cur.execute(
-            "INSERT INTO messages (dialog_chat_id, author_id, message_text, timestamp) VALUES (?, ?, ?, ?)",
-            (chat_id, author_id, message_text, timestamp)
-        )
-        con.commit()
-        con.close()
-        logging.info(f"Saved message from {author_id} in chat {chat_id}")
-    except Exception as e:
-        logging.error(f"Error saving message in chat {chat_id}: {e}")
+_first_request_checked = False  # флаг для первого запроса
 
 # ---------------------- Авторизация Б24 ----------------------
 def save_auth_data(auth_payload):
-    """Сохраняет данные авторизации в файл."""
     app_token = auth_payload.get('application_token')
     if app_token:
         try:
@@ -322,17 +278,24 @@ def _admin_check():
     if tok != API_SECRET_TOKEN:
         abort(403)
 
-# ---------------------- Логирование запросов ----------------------
+# ---------------------- Глобальный before_request ----------------------
+_first_request_checked = False
+
 @app.before_request
-def _debug_log_request():
-    # служебные/админ-эндпойнты не блокируем
+def _before_every_request():
+    global _first_request_checked
+    # 1) один раз на первый запрос — гарантируем БД (аналог before_first_request в Flask<3)
+    if not _first_request_checked:
+        ensure_db_exists()
+        _first_request_checked = True
+
+    # 2) мягкое выключение бота
     if request.path.startswith('/api/admin'):
         return
-    # если бот "выключен" — глушим входящие вебхуки Б24
     if request.method == 'POST' and request.path.endswith('/python_bot/') and not bot_enabled():
         return ('', 204)
 
-    # логируем интересные пути
+    # 3) логируем интересные запросы
     if request.path.endswith('/python_bot/') or request.path.startswith('/api/'):
         hdrs = {k: v for k, v in request.headers.items()
                 if k.lower() in ('host','user-agent','content-type','x-forwarded-for','x-forwarded-proto','x-forwarded-prefix')}
@@ -340,7 +303,7 @@ def _debug_log_request():
         logging.info("REQ %s %s headers=%s body=%s", request.method, request.path, hdrs, body)
 
 @app.after_request
-def _debug_log_response(resp):
+def _after(resp):
     if request.path.endswith('/python_bot/') or request.path.startswith('/api/'):
         logging.info("RESP %s %s -> %s", request.method, request.path, resp.status_code)
     return resp
@@ -502,7 +465,7 @@ def webhook_handler():
 
     if event == 'ONAPPINSTALL':
         logging.info("Handling ONAPPINSTALL event.")
-        # Если вдруг удалили БД — создадим заново
+
         try:
             init_db()
             logging.info("DB ensured during ONAPPINSTALL.")
@@ -512,7 +475,7 @@ def webhook_handler():
         if not save_auth_data(auth_from_request):
             return "Failed to save auth", 500
 
-        handler_url = public_handler_url()  # учитываем X-Forwarded-Prefix
+        handler_url = public_handler_url()
 
         result = rest_command(auth_from_request, 'imbot.register', {
             'CODE': BOT_CODE,
@@ -532,7 +495,6 @@ def webhook_handler():
             logging.error(f"Failed to register bot. Response: {redact(result)}")
         return "OK"
 
-    # далее — все прочие события требуют валидного auth.json
     auth_data = get_current_auth()
     if not auth_data:
         logging.warning(f"No auth data in {AUTH_FILE}. Please install the app first.")
@@ -553,7 +515,7 @@ def webhook_handler():
             chat_id = int(chat_id_str)
             if not get_dialog_id(chat_id):
                 save_new_dialog(chat_id)
-            add_user(user_id, user_name, 'client')  # инициатор — клиент
+            add_user(user_id, user_name, 'client')
             add_participant_to_dialog(chat_id, user_id)
             logging.info(f"Bot joined chat {chat_id}. Transferring to operator queue...")
             rest_command(auth_data, 'imopenlines.bot.session.transfer', {
@@ -584,12 +546,7 @@ def webhook_handler():
 
     return "OK"
 
-# Подстраховка: перед первым запросом ещё раз проверим БД
-@app.before_first_request
-def _ensure_db_on_first_request():
-    ensure_db_exists()
-
-# ---------------------- Точка входа ----------------------
+# ---------------------- Локальный запуск ----------------------
 if __name__ == '__main__':
     logging.info("Starting Flask server for local debug...")
     init_db()
