@@ -132,6 +132,38 @@ def ensure_db_exists():
     except Exception as e:
         logging.error(f"ensure_db_exists failed: {e}")
 
+def save_new_dialog(chat_id: int):
+    """Создаёт запись о диалоге, если её ещё нет."""
+    try:
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        start_time = datetime.now().isoformat()
+        cur.execute(
+            "INSERT OR IGNORE INTO dialogs (chat_id, start_time) VALUES (?, ?)",
+            (chat_id, start_time)
+        )
+        con.commit()
+        con.close()
+        logging.info(f"Saved new dialog with chat_id: {chat_id}")
+    except Exception as e:
+        logging.error(f"Error saving new dialog {chat_id}: {e}")
+
+def save_message(chat_id: int, author_id, message_text: str):
+    """Сохраняет сообщение (author_id может быть None — тогда пишем -1)."""
+    try:
+        con = sqlite3.connect(DB_FILE)
+        cur = con.cursor()
+        timestamp = datetime.now().isoformat()
+        cur.execute(
+            "INSERT INTO messages (dialog_chat_id, author_id, message_text, timestamp) VALUES (?, ?, ?, ?)",
+            (chat_id, author_id if author_id is not None else -1, message_text, timestamp)
+        )
+        con.commit()
+        con.close()
+        logging.info(f"Saved message from {author_id} in chat {chat_id}")
+    except Exception as e:
+        logging.error(f"Error saving message in chat {chat_id}: {e}")
+
 # гарантия при старте воркера gunicorn
 ensure_db_exists()
 _first_request_checked = False  # флаг для первого запроса
@@ -451,6 +483,17 @@ def get_users():
         return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
 
 # ---------------------- Вебхук бота ----------------------
+# ПИНГ для проверки URL руками
+@app.route('/python_bot/', methods=['GET'])
+def webhook_ping():
+    return jsonify({
+        'ok': True,
+        'instance': INSTANCE,
+        'prefix': request.headers.get('X-Forwarded-Prefix'),
+        'host': request.host,
+        'path': request.path
+    }), 200
+
 @app.route('/python_bot/', methods=['POST'])
 def webhook_handler():
     data = parse_bitrix_data(request.form)
@@ -507,16 +550,24 @@ def webhook_handler():
     if event == 'ONIMBOTJOINCHAT':
         params = data.get('data', {}).get('PARAMS', {})
         user_info = data.get('data', {}).get('USER', {})
-        chat_id_str = params.get('CHAT_ID')
-        user_id = user_info.get('ID')
-        user_name = user_info.get('NAME')
 
-        if chat_id_str and user_id:
+        chat_id_str = params.get('CHAT_ID')
+        user_id = user_info.get('ID')      # может быть 0
+        user_name = user_info.get('NAME') or ''
+
+        if chat_id_str:
             chat_id = int(chat_id_str)
+
+            # Всегда фиксируем сам диалог
             if not get_dialog_id(chat_id):
                 save_new_dialog(chat_id)
-            add_user(user_id, user_name, 'client')
-            add_participant_to_dialog(chat_id, user_id)
+
+            # Добавляем участника, если ID присутствует (включая 0)
+            if user_id is not None:
+                role = 'client' if (user_info.get('IS_EXTRANET') == 'Y') else 'manager'
+                add_user(user_id, user_name, role)
+                add_participant_to_dialog(chat_id, user_id)
+
             logging.info(f"Bot joined chat {chat_id}. Transferring to operator queue...")
             rest_command(auth_data, 'imopenlines.bot.session.transfer', {
                 'CHAT_ID': chat_id,
@@ -530,18 +581,21 @@ def webhook_handler():
 
         chat_id_str  = params.get('CHAT_ID')
         author_id    = params.get('AUTHOR_ID')
-        author_name  = user_info.get('NAME', '')
+        author_name  = user_info.get('NAME', '') or ''
         message_text = params.get('MESSAGE')
 
-        is_extranet  = user_info.get('IS_EXTRANET') == 'Y'
-        author_role  = 'client' if is_extranet else 'manager'
-
-        if chat_id_str and author_id and message_text:
+        if chat_id_str and message_text:
             chat_id = int(chat_id_str)
+
             if not get_dialog_id(chat_id):
                 save_new_dialog(chat_id)
-            add_user(author_id, author_name, author_role)
-            add_participant_to_dialog(chat_id, author_id)
+
+            if author_id is not None:
+                is_extranet = user_info.get('IS_EXTRANET') == 'Y'
+                author_role = 'client' if is_extranet else 'manager'
+                add_user(author_id, author_name, author_role)
+                add_participant_to_dialog(chat_id, author_id)
+
             save_message(chat_id, author_id, message_text)
 
     return "OK"
