@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-import requests
-from flask import Flask, request, jsonify, abort
-import logging
 import json
+import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta, time
 from functools import wraps
+
+import requests
+from flask import Flask, request, jsonify, abort, Response
+from logging.handlers import RotatingFileHandler
 
 # --- Базовая директория инстанса (каталог, где лежит этот файл) ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,31 +22,57 @@ DB_FILE   = os.path.join(BASE_DIR, "dialogs.db")
 ENABLED_FLAG  = os.path.join(BASE_DIR, "ENABLED")   # если нужен явный "включен"
 DISABLED_FLAG = os.path.join(BASE_DIR, "DISABLED")  # если существует — бот выключен
 
-# Секретный токен для доступа к API (можно задать через ENV: API_SECRET_TOKEN)
+# --- Переменные окружения/настройки инстанса ---
+# Имя инстанса: берём из ENV или из имени директории
+INSTANCE = os.environ.get('INSTANCE') or os.path.basename(BASE_DIR)
+# Код бота в Bitrix24 (должен быть уникальным в портале)
+BOT_CODE = os.environ.get('BOT_CODE', f'py_interceptor_bot_{INSTANCE}')
+# Секретный токен для админ-эндпойнтов (ENV предпочтительнее)
 API_SECRET_TOKEN = os.environ.get('API_SECRET_TOKEN', 'asd1a2s3d4asd41a23sdas4d')
+# Уровень логирования (можно менять через /api/admin/loglevel)
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
 
-# --- Логирование ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
-    ]
-)
+# --- Логирование с ротацией ---
+logger = logging.getLogger()
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s:%(lineno)d - %(message)s')
+
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding='utf-8')
+file_handler.setFormatter(fmt)
+
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(fmt)
+
+logger.handlers = [file_handler, stream_handler]
 
 app = Flask(__name__)
 
+# --- Маскирование секретов в логах ---
+SENSITIVE_KEYS = {'token', 'access_token', 'refresh_token', 'application_token', 'client_secret', 'API_SECRET_TOKEN', 'auth'}
+
+def _mask_val(v: str) -> str:
+    if not isinstance(v, str) or len(v) <= 8:
+        return '***'
+    return v[:4] + '…' + v[-4:]
+
+def redact(obj):
+    """Рекурсивно маскирует чувствительные поля в dict/list/str для логов."""
+    if isinstance(obj, dict):
+        return {k: (_mask_val(v) if k.lower() in SENSITIVE_KEYS else redact(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact(x) for x in obj]
+    return obj
+
+def _startup_dump():
+    logging.info("Startup: INSTANCE=%s BOT_CODE=%s API_SECRET_TOKEN_len=%s",
+                 INSTANCE, BOT_CODE, len(API_SECRET_TOKEN) if API_SECRET_TOKEN else 0)
+
+_startup_dump()
+
 # ---------------------- Утилиты ----------------------
 def bot_enabled() -> bool:
-    """
-    Мягкое включение/выключение:
-    - если есть файл DISABLED -> выключен
-    - иначе включен (даже если файла ENABLED нет)
-    """
-    if os.path.exists(DISABLED_FLAG):
-        return False
-    return True  # default: enabled
+    """Мягкое включение/выключение: DISABLED → выключен, иначе включен."""
+    return not os.path.exists(DISABLED_FLAG)
 
 def public_handler_url():
     """
@@ -53,13 +81,12 @@ def public_handler_url():
     """
     proto  = request.headers.get('X-Forwarded-Proto', request.scheme or 'http')
     prefix = request.headers.get('X-Forwarded-Prefix', '')
-    # request.path == "/python_bot/" внутри Flask (префикс уже срезан Nginx-ом)
     public_path = (prefix.rstrip('/') + request.path) if prefix else request.path
     return f"{proto}://{request.host}{public_path}"
 
 # ---------------------- Работа с БД ----------------------
 def init_db():
-    """Инициализирует базу данных и создает таблицы, если их нет."""
+    """Инициализирует базу данных и создаёт таблицы, если их нет."""
     try:
         con = sqlite3.connect(DB_FILE)
         cur = con.cursor()
@@ -103,7 +130,24 @@ def init_db():
     except Exception as e:
         logging.error(f"Error initializing database: {e}")
 
+def ensure_db_exists():
+    """Создать БД и таблицы, если файла нет или структура отсутствует."""
+    try:
+        need = not os.path.exists(DB_FILE)
+        if not need:
+            con = sqlite3.connect(DB_FILE)
+            cur = con.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='dialogs'")
+            need = (cur.fetchone() is None)
+            con.close()
+        if need:
+            init_db()
+            logging.info("DB ensured (auto)")
+    except Exception as e:
+        logging.error(f"ensure_db_exists failed: {e}")
 
+# Гарантия при старте воркера gunicorn
+ensure_db_exists()
 
 def save_new_dialog(chat_id):
     try:
@@ -165,20 +209,22 @@ def rest_command(auth_data, method, params=None):
     api_url = f"{auth_data['client_endpoint']}{method}"
     params['auth'] = auth_data['access_token']
     try:
+        logging.info("REST %s -> %s", method, api_url)
         response = requests.post(api_url, json=params, timeout=15)
-        response.raise_for_status()
-        js = response.json()
-        if 'error' in js:
-            logging.error(f"Bitrix error for {method}: {js}")
+        status = response.status_code
+        try:
+            js = response.json()
+        except Exception:
+            js = {'non_json': response.text[:2000]}
+        if status >= 400 or 'error' in js:
+            logging.error("REST %s FAILED status=%s body=%s", method, status, redact(js))
         else:
-            logging.info(f"Sent command {method}, response OK")
+            logging.info("REST %s OK status=%s result_keys=%s", method, status, list(js.keys()))
+        response.raise_for_status()
         return js
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error sending REST command {method}: {e}")
-        try:
-            return {'error': str(e), 'details': response.json()}
-        except Exception:
-            return {'error': str(e), 'details': getattr(response, 'text', 'no body')}
+        logging.error("REST %s exception: %s", method, e)
+        return {'error': str(e)}
 
 # ---------------------- Хелперы ----------------------
 def parse_bitrix_data(post_data):
@@ -271,19 +317,40 @@ def token_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# ---------------------- Админ-эндпойнты включения/выключения ----------------------
 def _admin_check():
     tok = request.args.get('token') or request.headers.get('X-API-Token')
     if tok != API_SECRET_TOKEN:
         abort(403)
 
+# ---------------------- Логирование запросов ----------------------
+@app.before_request
+def _debug_log_request():
+    # служебные/админ-эндпойнты не блокируем
+    if request.path.startswith('/api/admin'):
+        return
+    # если бот "выключен" — глушим входящие вебхуки Б24
+    if request.method == 'POST' and request.path.endswith('/python_bot/') and not bot_enabled():
+        return ('', 204)
+
+    # логируем интересные пути
+    if request.path.endswith('/python_bot/') or request.path.startswith('/api/'):
+        hdrs = {k: v for k, v in request.headers.items()
+                if k.lower() in ('host','user-agent','content-type','x-forwarded-for','x-forwarded-proto','x-forwarded-prefix')}
+        body = request.get_data(as_text=True)[:4000]
+        logging.info("REQ %s %s headers=%s body=%s", request.method, request.path, hdrs, body)
+
+@app.after_request
+def _debug_log_response(resp):
+    if request.path.endswith('/python_bot/') or request.path.startswith('/api/'):
+        logging.info("RESP %s %s -> %s", request.method, request.path, resp.status_code)
+    return resp
+
+# ---------------------- Админ-эндпойнты ----------------------
 @app.route('/api/admin/enable', methods=['POST'])
 def admin_enable():
     _admin_check()
-    # Удаляем жёсткий флаг выключения
     if os.path.exists(DISABLED_FLAG):
         os.remove(DISABLED_FLAG)
-    # (Опционально) создаём ENABLED как маркер
     try:
         with open(ENABLED_FLAG, 'w') as _:
             pass
@@ -294,7 +361,6 @@ def admin_enable():
 @app.route('/api/admin/disable', methods=['POST'])
 def admin_disable():
     _admin_check()
-    # Создаём флаг выключения
     with open(DISABLED_FLAG, 'w') as _:
         pass
     return jsonify({'ok': True, 'enabled': False})
@@ -302,17 +368,31 @@ def admin_disable():
 @app.route('/api/admin/status', methods=['GET'])
 def admin_status():
     _admin_check()
-    return jsonify({'ok': True, 'enabled': bot_enabled()})
+    return jsonify({'ok': True, 'enabled': bot_enabled(), 'instance': INSTANCE, 'bot_code': BOT_CODE})
 
-# ---------------------- Глобальный guard для мягкого OFF ----------------------
-@app.before_request
-def guard():
-    # служебные/админ-эндпойнты не блокируем
-    if request.path.startswith('/api/admin'):
-        return
-    # если бот "выключен" — глушим входящие вебхуки Б24
-    if request.method == 'POST' and request.path.endswith('/python_bot/') and not bot_enabled():
-        return ('', 204)
+@app.route('/api/admin/loglevel', methods=['POST'])
+def admin_loglevel():
+    _admin_check()
+    lvl = (request.args.get('level') or (request.json.get('level') if request.is_json else '')).upper()
+    if lvl not in ('DEBUG','INFO','WARNING','ERROR','CRITICAL'):
+        return jsonify({'ok': False, 'error': 'bad level'}), 400
+    logging.getLogger().setLevel(getattr(logging, lvl))
+    logging.info("Log level changed to %s by admin", lvl)
+    return jsonify({'ok': True, 'level': lvl})
+
+@app.route('/api/admin/logs', methods=['GET'])
+def admin_logs():
+    _admin_check()
+    try:
+        n = int(request.args.get('lines', 200))
+    except Exception:
+        n = 200
+    try:
+        with open(LOG_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()[-n:]
+        return Response(''.join(lines), mimetype='text/plain; charset=utf-8')
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 # ---------------------- Публичные API ----------------------
 def get_time_range_utc(args):
@@ -418,12 +498,11 @@ def webhook_handler():
         auth_from_request['application_token'] = data.get('auth[application_token]')
     app_token = auth_from_request.get('application_token')
 
-    logging.info(f"Received event: {event} with app_token: {app_token}")
+    logging.info(f"Received event: {event} with app_token: { _mask_val(app_token) if app_token else None }")
 
     if event == 'ONAPPINSTALL':
         logging.info("Handling ONAPPINSTALL event.")
-
-        #Если вдруг удалили бд
+        # Если вдруг удалили БД — создадим заново
         try:
             init_db()
             logging.info("DB ensured during ONAPPINSTALL.")
@@ -433,10 +512,10 @@ def webhook_handler():
         if not save_auth_data(auth_from_request):
             return "Failed to save auth", 500
 
-        handler_url = public_handler_url()  # ключевая правка: учитываем X-Forwarded-Prefix
+        handler_url = public_handler_url()  # учитываем X-Forwarded-Prefix
 
         result = rest_command(auth_from_request, 'imbot.register', {
-            'CODE': 'py_interceptor_bot',
+            'CODE': BOT_CODE,
             'TYPE': 'O',
             'EVENT_WELCOME_MESSAGE': handler_url,
             'EVENT_MESSAGE_ADD':    handler_url,
@@ -450,16 +529,17 @@ def webhook_handler():
         if result and 'result' in result:
             logging.info(f"Bot registered with ID: {result.get('result')}")
         else:
-            logging.error(f"Failed to register bot. Response: {result}")
+            logging.error(f"Failed to register bot. Response: {redact(result)}")
         return "OK"
 
+    # далее — все прочие события требуют валидного auth.json
     auth_data = get_current_auth()
     if not auth_data:
         logging.warning(f"No auth data in {AUTH_FILE}. Please install the app first.")
         return "Unauthorized", 401
 
     if auth_data.get('application_token') != app_token:
-        logging.warning(f"Mismatched token! Expected {auth_data.get('application_token')}, got {app_token}")
+        logging.warning(f"Mismatched token! Expected { _mask_val(auth_data.get('application_token')) }, got { _mask_val(app_token) }")
         return "Forbidden", 403
 
     if event == 'ONIMBOTJOINCHAT':
@@ -503,6 +583,11 @@ def webhook_handler():
             save_message(chat_id, author_id, message_text)
 
     return "OK"
+
+# Подстраховка: перед первым запросом ещё раз проверим БД
+@app.before_first_request
+def _ensure_db_on_first_request():
+    ensure_db_exists()
 
 # ---------------------- Точка входа ----------------------
 if __name__ == '__main__':
